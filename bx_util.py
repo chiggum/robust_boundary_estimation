@@ -18,6 +18,7 @@ from scipy.sparse.linalg import svds
 import time
 import torch
 import torch.nn as nn
+from scipy.sparse.csgraph import dijkstra
 
 import multiprocess as mp
 
@@ -40,7 +41,8 @@ default_opts = {
     'W': None,
     'local_subspace': None,
     'only_kde': False,
-    'ds': True
+    'ds': True,
+    'no_newton': True
 }
 
 def sinkhorn(K, maxiter=20000, delta=1e-15, eps=0, boundC = 1e-8, print_freq=1000):
@@ -177,6 +179,28 @@ def compute_dxi(bx, h, d=2):
     dbxbyhm1 = m1/h + (bx/h)*dm1
     sqrt_term = np.sqrt((bxbyhm1+m0)**2-2*(m1**2))
     return -0.5*(dbxbyhm1 + ((dbxbyhm1+dm0)*(bxbyhm1+m0) - 2*m1*dm1)/sqrt_term) + dm2
+
+def compute_beta(bx, h, d=2):
+    m1 = compute_m1(bx, h, d)
+    m2 = compute_m2(bx, h, d)
+    zeta = compute_zeta(bx, h, d)
+    return (m1*zeta)/(np.pi**(d/2) + 2*m2*zeta)
+
+def compute_dbeta(bx, h, d=2):
+    m1 = compute_m1(bx, h, d)
+    m2 = compute_m2(bx, h, d)
+    zeta = compute_zeta(bx, h, d)
+
+    dm1 = compute_dm1(bx, h, d)
+    dm2 = compute_dm2(bx, h, d)
+    dzeta = compute_dzeta(bx, h, d)
+
+    num = m1*zeta
+    dnum = (dm1*zeta + m1*dzeta)
+    denom = np.pi**(d/2) + 2*m2*zeta
+    ddenom = 2*(dm2*zeta + zeta*dm2)
+    
+    return (dnum*denom-ddenom*num)/(denom**2 + 1e-20)
     
 def epanechnikov_kernel(dist, eps):
     return (1-dist**2/eps)*(dist > 0)*(dist < np.sqrt(eps))
@@ -342,6 +366,21 @@ def compute_jaccard_index(ddX, bx, prctile=10):
     mask = bx <= np.percentile(bx, prctile)
     return np.sum(mask*mask0)/np.sum((mask+mask0) > 0)
 
+def compute_distances_from_boundary(d_e, bx, percentiles=[10]):
+    max_percentile = np.max(percentiles)
+    mask = bx <= np.percentile(bx, max_percentile)
+    pts_on_boundary = np.where(mask)[0]
+    dist = dijkstra(d_e, directed=False, indices=pts_on_boundary)
+    inv_ind_map = np.zeros(len(mask), dtype=int)+len(bx)+1
+    inv_ind_map[pts_on_boundary] = np.arange(len(pts_on_boundary))
+                                             
+    dist_from_pts_on_boundary = []
+    for i in range(len(percentiles)):
+        mask_i = bx <= np.percentile(bx, percentiles[i])
+        pts_on_boundary_i = np.where(mask_i)[0]
+        dist_from_pts_on_boundary.append(np.min(dist[inv_ind_map[pts_on_boundary_i],:], axis=0))
+    return np.array(dist_from_pts_on_boundary)
+
 # Berry and Sauer's method to estimate bx
 # If opts['local_pca'] = True then uses
 # local pca to compute ||\nu||
@@ -356,6 +395,7 @@ def estimate_bx_berry_and_sauer(X, opts=default_opts):
     if h is None:
         # Compute bandwidth for each point
         h = compute_autotuned_bandwidth(neigh_ind, neigh_dist, opts['k_tune'], opts['maxiter_for_selecting_bw'])
+        h = np.median(h)
 
     # Compute kernel
     K, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h)
@@ -366,6 +406,9 @@ def estimate_bx_berry_and_sauer(X, opts=default_opts):
         return g_hat
         
     nu_norm = compute_nu_norm(X, neigh_ind, K, d, opts['local_subspace'])
+    #nu_norm = opts['h']*nu_norm/(np.max(nu_norm/g_hat) * np.sqrt(np.pi))
+    # if opts['no_newton']:
+    #     return 1/(nu_norm/g_hat+1), g_hat, nu_norm
 
     def F(bx):
         return h * g_hat * compute_m1(bx, h, d) + nu_norm * compute_m0(bx, h, d) # plus because m1 is negative
@@ -392,6 +435,7 @@ def estimate_bx(X, opts=default_opts):
     if h is None:
         # Compute bandwidth for each point
         h = compute_autotuned_bandwidth(neigh_ind, neigh_dist, opts['k_tune'], opts['maxiter_for_selecting_bw'])
+        h = np.median(h)
 
     if ('W' in opts) and (opts['W'] is not None):
         W = opts['W']
@@ -405,19 +449,39 @@ def estimate_bx(X, opts=default_opts):
         return g_hat
     
     nu_norm = compute_nu_norm(X, neigh_ind, W, d, opts['local_subspace'])
-    nu_norm = opts['h']*nu_norm*0.5*(np.sqrt(np.pi)-np.sqrt(np.pi-2))/np.max(nu_norm)
+
+    if opts['no_newton']:
+        return 1/(nu_norm+1), 1/(nu_norm+1), W, D, nu_norm
+    
+    nu_norm = nu_norm*opts['h']*0.5*(np.sqrt(np.pi)-np.sqrt(np.pi-2))/np.max(nu_norm)
     # Initialized bx
     bx_init = np.zeros(n)
 
     def F(bx):
-        xi = compute_xi(bx, h, d)
         m1 = compute_m1(bx, h, d)
-        return nu_norm*m1 + h*xi
+        m2 = compute_m2(bx, h, d)
+        zeta = compute_zeta(bx, h, d)
+        c = np.pi**(d/2)
+        return nu_norm*(c+2*m2*zeta) + h*m1*zeta
 
     def F_prime(bx):
-        dxi = compute_dxi(bx, h, d)
+        m1 = compute_m1(bx, h, d)
+        m2 = compute_m2(bx, h, d)
+        zeta = compute_zeta(bx, h, d)
         dm1 = compute_dm1(bx, h, d)
-        return nu_norm*dm1 + h*dxi
+        dm2 = compute_dm2(bx, h, d)
+        dzeta = compute_dzeta(bx, h, d)
+        return 2*nu_norm*(dm2*zeta+m2*dzeta) + h*(dm1*zeta+m1*dzeta)
+
+    # def F(bx):
+    #     xi = compute_xi(bx, h, d)
+    #     m1 = compute_m1(bx, h, d)
+    #     return nu_norm*m1 + h*xi
+
+    # def F_prime(bx):
+    #     dxi = compute_dxi(bx, h, d)
+    #     dm1 = compute_dm1(bx, h, d)
+    #     return nu_norm*dm1 + h*dxi
     # def F(bx):
     #     xi = compute_xi(bx, h, d)
     #     m1 = compute_m1(bx, h, d)
