@@ -422,6 +422,44 @@ def estimate_bx_berry_and_sauer(X, opts=default_opts):
     bx = optimize_for_bx(bx_init, F, F_prime, opts['optimizer_maxiter'])
     return bx, bx_init, nu_norm
 
+def estimate_smooth_bx_using_gd(X, W, nu_norm, h, opts=default_opts):
+    d = opts['d']
+    def F(bx):
+        m1 = compute_m1(bx, h, d)
+        m2 = compute_m2(bx, h, d)
+        zeta = compute_zeta(bx, h, d)
+        c = np.pi**(d/2)
+        return nu_norm*(c+2*m2*zeta) + h*m1*zeta
+
+    def F_prime(bx):
+        m1 = compute_m1(bx, h, d)
+        m2 = compute_m2(bx, h, d)
+        zeta = compute_zeta(bx, h, d)
+        dm1 = compute_dm1(bx, h, d)
+        dm2 = compute_dm2(bx, h, d)
+        dzeta = compute_dzeta(bx, h, d)
+        return 2*nu_norm*(dm2*zeta+m2*dzeta) + h*(dm1*zeta+m1*dzeta)
+        
+    bx = np.zeros(X.shape[0])
+    lr = opts['lr']
+    reg = opts['reg']
+    n = bx.shape[0]
+    # minimize F(bx)^2 + bx^T(I-W)bx
+    for i in range(opts['optimizer_maxiter']):
+        Fbx = F(bx)
+        Wbx = W.dot(bx)
+        bx_minus_Wbx = bx - Wbx
+        #loss = np.mean(Fbx**2) + reg * np.sum(bx*bx_minus_Wbx)
+        loss = np.mean(Fbx**2) 
+        if loss < 1e-12:
+            print('Converged at iter:', i+1)
+            break
+        print('Iter:', i+1, ':: loss:', loss)
+        grad_bx = 2*Fbx*F_prime(bx)/n + reg*bx_minus_Wbx
+        bx = bx - lr * grad_bx
+        bx = np.maximum(bx, 0)
+    return bx
+
 def estimate_bx(X, opts=default_opts):
     d = opts['d']
     h = opts['h']
@@ -436,6 +474,7 @@ def estimate_bx(X, opts=default_opts):
         # Compute bandwidth for each point
         h = compute_autotuned_bandwidth(neigh_ind, neigh_dist, opts['k_tune'], opts['maxiter_for_selecting_bw'])
         h = np.median(h)
+        opts['h'] = h
 
     if ('W' in opts) and (opts['W'] is not None):
         W = opts['W']
@@ -453,7 +492,7 @@ def estimate_bx(X, opts=default_opts):
     if opts['no_newton']:
         return 1/(nu_norm+1), 1/(nu_norm+1), W, D, nu_norm
     
-    nu_norm = nu_norm*opts['h']*0.5*(np.sqrt(np.pi)-np.sqrt(np.pi-2))/np.max(nu_norm)
+    nu_norm = nu_norm*h*0.5*(np.sqrt(np.pi)-np.sqrt(np.pi-2))/np.max(nu_norm)
     # Initialized bx
     bx_init = np.zeros(n)
 
@@ -502,6 +541,7 @@ def estimate_bx(X, opts=default_opts):
     if opts['optimizer'] == 'newton':
         bx = optimize_for_bx(bx_init, F, F_prime, opts['optimizer_maxiter'])
     else:
+        printfreq = opts['optimizer_maxiter']//20
         bx = bx_init.copy()
         lr = opts['lr']
         reg = opts['reg']
@@ -516,7 +556,8 @@ def estimate_bx(X, opts=default_opts):
             if loss < 1e-12:
                 print('Converged at iter:', i+1)
                 break
-            print('Iter:', i+1, ':: loss:', loss)
+            if i%printfreq == 0:
+                print('Iter:', i+1, ':: loss:', loss)
             grad_bx = 2*Fbx*F_prime(bx)/n + reg*bx_minus_Wbx
             bx = bx - lr * grad_bx
             bx = np.maximum(bx, 0)
