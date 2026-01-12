@@ -19,6 +19,7 @@ import time
 import torch
 import torch.nn as nn
 from scipy.sparse.csgraph import dijkstra
+from joblib import Parallel, delayed
 
 import multiprocess as mp
 
@@ -30,7 +31,8 @@ EPS = 1e-30
 default_opts = {
     'd': 2,
     'k_nn': 128,
-    'k_tune': 128,
+    'k_tune': 32,
+    'k_pca': None,
     'h': None,
     's': 0.1,
     'optimizer': 'newton',
@@ -45,7 +47,7 @@ default_opts = {
     'no_newton': True
 }
 
-def sinkhorn(K, maxiter=20000, delta=1e-15, eps=0, boundC = 1e-8, print_freq=1000):
+def sinkhorn(K, maxiter=20000, delta=1e-15, eps=0, boundC = 1e-8, print_freq=1):
     """https://epubs.siam.org/doi/pdf/10.1137/20M1342124 """
     n = K.shape[0]
     r = np.ones((n,1))
@@ -56,7 +58,7 @@ def sinkhorn(K, maxiter=20000, delta=1e-15, eps=0, boundC = 1e-8, print_freq=100
     assert np.min(x) > boundC, 'assert min(x) > boundC failed.'
     for tau in range(maxiter):
         error =  np.max(np.abs(u*(K.dot(v)) - r))
-        if tau%print_freq:
+        if (print_freq is not None) and (tau%print_freq):
             print('Error:', error, flush=True)
         
         if error < delta:
@@ -151,6 +153,229 @@ def compute_zeta(bx, h, d=2):
     m2 = bxhm1 + m0/2
     temp = ((np.pi**(d/2))/2)*(bxhm1 + np.sqrt((bxhm1+m0)**2 - 2*(m1**2)))/(m2*m0-m1**2)
     return temp
+
+# def compute_q(bx, W, h, k_nn, d=2, X=None, s=2, u=0.5, metric='euclidean'):
+#     zeta = compute_zeta(bx, h, d)
+#     zeta_inv = 1/zeta
+#     zeta_inv_s = zeta_inv**s
+#     m0 = compute_m0(bx, h/np.sqrt(s), d)
+#     m0_inv = 1/m0
+#     m0_inv_u = m0_inv**u
+#     m0_inv_1mu = m0_inv**(1-u)
+#     zeta_inv_s_u = zeta_inv_s**u
+#     zeta_inv_s_1mu = zeta_inv_s**(1-u)
+    
+#     if W is None:
+#         neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric=metric)
+#         neigh_dist = neigh_dist[:,1:]
+#         neigh_ind = neigh_ind[:,1:]
+#         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+    
+#     W = W.copy()
+#     W.data = W.data**s
+#     W = W.tocoo()
+#     W.data = m0_inv_u[W.row]*m0_inv_1mu[W.col]*zeta_inv_s_u[W.row]*zeta_inv_s_1mu[W.col]*W.data
+#     #q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
+#     q = W.sum(axis=1)
+#     q = np.array(q).flatten()
+#     return q**(1/(1-s)), W
+
+# def compute_q(bx, W, h, k_nn, d=2, X=None, s=2, u=0.5, metric='euclidean'):
+#     zeta = compute_zeta(bx, h, d)
+#     zeta_inv = 1/zeta
+#     m0 = compute_m0(bx, h/np.sqrt(s), d)
+#     m0_u = m0**u
+#     m0_1mu = m0**(1-u)
+#     zeta_inv_u = zeta_inv**u
+#     zeta_inv_1mu = zeta_inv**(1-u)
+    
+#     if W is None:
+#         neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric=metric)
+#         neigh_dist = neigh_dist[:,1:]
+#         neigh_ind = neigh_ind[:,1:]
+#         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+    
+#     W0 = W.copy()
+#     W0 = W0.tocoo()
+#     col = W0.col.copy()
+#     row = W0.row.copy()
+#     W0 = W0.tocsr()
+#     W0.data = zeta_inv_u[row]*zeta_inv_1mu[col]*W0.data
+    
+#     m0_u_1mu_data = m0_u[row]*m0_1mu[col]
+#     W0.data = s*np.log(W0.data) - np.log(m0_u_1mu_data)
+#     W0_max_across_col = []
+#     for i in range(W0.shape[0]):
+#         W0_max_across_col.append(np.max(W0[i,:].data))
+#     W0_max_across_col = np.array(W0_max_across_col)
+#     W0.data = np.exp(W0.data - W0_max_across_col[col])
+#     q = W0.sum(axis=1)
+#     q = np.array(q).flatten()
+#     q = W0_max_across_col + np.log(q)
+#     q = q*(1/(1-s))
+#     return np.exp(q), W
+#     #q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
+#     #q = W.sum(axis=1)
+#     #q = np.array(q).flatten()
+#     #return q**(1/(1-s)), W
+
+def compute_q(bx, W, h, k_nn, d=2, X=None, s=2, u=0.5, metric='euclidean'):
+    if W is None:
+        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric=metric)
+        neigh_dist = neigh_dist[:,1:]
+        neigh_ind = neigh_ind[:,1:]
+        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+    
+    W = W.copy()
+    
+    m0 = compute_m0(bx, h/np.sqrt(s), d)
+    m0_inv = 1/m0
+    m0_inv_u = m0_inv**u
+    m0_inv_1mu = m0_inv**(1-u)
+
+    zeta = compute_zeta(bx, h, d)
+    zeta_inv = 1/zeta
+    zeta_inv_s = zeta_inv**s
+    zeta_inv_s_u = zeta_inv_s**u
+    zeta_inv_s_1mu = zeta_inv_s**(1-u)
+    
+    
+    W.data = W.data**s
+    W = W.tocoo()
+    W.data = m0_inv_u[W.row]*m0_inv_1mu[W.col]*zeta_inv_s_u[W.row]*zeta_inv_s_1mu[W.col]*W.data
+    #q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
+    q = W.sum(axis=1)
+    q = np.array(q).flatten()
+    return q**(1/(1-s)), W
+
+def compute_q_across_s_and_u(bx, W, h, k_nn, d=2, X=None, s_list=[2], u_list=[0.5], metric='euclidean'):
+    if W is None:
+        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric=metric)
+        neigh_dist = neigh_dist[:,1:]
+        neigh_ind = neigh_ind[:,1:]
+        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+
+    q_for_each_s_and_u = []
+    for s in s_list:
+        q_for_each_u = []
+        for u in u_list:
+            qu, _ = compute_q(bx, W, h, k_nn, d=d, X=X, s=s, u=u, metric=metric)
+            q_for_each_u.append(qu)
+        q_for_each_s_and_u.append(q_for_each_u)
+    return q_for_each_s_and_u, W
+
+def compute_q_across_k_nn_and_s_and_u(bx, h, k_nn_list=[256], d=2, X=None, s_list=[2], u_list=[0.5], metric='euclidean'):
+    q_for_each_knn = []
+    for i in range(len(k_nn_list)):
+        q, _ = compute_q_across_s_and_u(bx, None, h, k_nn_list[i], d, X, s_list, u_list, metric=metric)
+        q_for_each_knn.append(q)
+    return q_for_each_knn
+
+def compute_q1(bx, W, h, k_nn, d=2, X=None, s=2):
+    zeta = compute_zeta(bx, h, d)
+    #zeta_inv = 1/zeta
+    m0 = compute_m0(bx, h/np.sqrt(s), d)
+    if W is None:
+        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist = neigh_dist[:,1:]
+        neigh_ind = neigh_ind[:,1:]
+        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+    
+    W = W.copy()
+    W.data = W.data**s
+    W = W.tocoo()
+    #W.data = zeta_inv[W.row]*zeta_inv[W.col]*W.data
+    q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
+    #q = W.sum(axis=1)
+    q = np.array(q).flatten()
+    q = m0*(zeta**s)/q
+    return q**(1/(s-1))
+
+def compute_q2(bx, W, h, k_nn, d=2, X=None, s=2):
+    zeta = compute_zeta(bx, h, d)
+    zeta_inv = 1/zeta
+    zeta_inv = zeta_inv**s
+    m0 = compute_m0(bx, h/np.sqrt(2), d)
+    if W is None:
+        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist = neigh_dist[:,1:]
+        neigh_ind = neigh_ind[:,1:]
+        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+    
+    W = W.copy()
+    W.data = W.data**s
+    W = W.tocoo()
+    W.data = zeta_inv[W.col]*W.data
+    q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
+    #q = W.sum(axis=1)
+    q = np.array(q).flatten()
+    q = m0/q
+    return q**(1/(s-1))
+
+def compute_q_wo_boundary_correction(W, h, k_nn, d=2, X=None, s=2):
+    if W is None:
+        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist = neigh_dist[:,1:]
+        neigh_ind = neigh_ind[:,1:]
+        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+    W = W.copy()
+    W.data = W.data**s
+    W = W.tocoo()
+    q = W.sum(axis=1)/(k_nn-1)
+    q = np.array(q).flatten()
+    q = 1/q
+    return q**(1/(s-1)), W
+
+def compute_q_wo_boundary_correction_across_s(W, h, k_nn, d=2, X=None, s_list=[2]):
+    if W is None:
+        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist = neigh_dist[:,1:]
+        neigh_ind = neigh_ind[:,1:]
+        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+
+    q_for_each_s = []
+    for s in s_list:
+        qs, _ = compute_q_wo_boundary_correction(W, h, k_nn, d=d, X=X, s=s)
+        q_for_each_s.append(qs)
+    return q_for_each_s, W
+
+def compute_q_wo_boundary_correction_across_k_nn_and_s(h, k_nn_list=[256], d=2, X=None, s_list=[2]):
+    q_for_each_knn = []
+    for i in range(len(k_nn_list)):
+        q, _ = compute_q_wo_boundary_correction_across_s(None, h, k_nn_list[i], d, X, s_list)
+        q_for_each_knn.append(q)
+    return q_for_each_knn
+
+def compute_q_old(bx, W, h, k_nn, d=2, X=None):
+    m00 = compute_m0(bx, h, d)
+    m00 = (np.pi**(d/2))/m00
+    m0 = compute_m0(bx, h/np.sqrt(2), d)
+    if W is None:
+        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist = neigh_dist[:,1:]
+        neigh_ind = neigh_ind[:,1:]
+        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
+    W = W.copy()
+    W.data = W.data**2
+    W = W.tocoo()
+    W.data = m00[W.row]*m00[W.col]*W.data
+    q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
+    q = np.array(q).flatten()
+    q = 1/q
+    return q*m0
+
+def compute_q_berry_and_sauer(bx, K, h, k_nn, d=2, X=None):
+    m00 = compute_m0(bx, h, d)
+    m00 = 1/m00
+    if K is None:
+        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist = neigh_dist[:,1:]
+        neigh_ind = neigh_ind[:,1:]
+        K, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=False)
+    K = K.copy().tocoo()
+    K.data = m00[K.row]*m00[K.col]*K.data
+    q = np.array(K.sum(axis=1)).flatten()
+    return q
 
 def compute_rho_from_zeta(bx, h, d=2, q=1):
     rho2q = compute_zeta(bx, h, d=2)
@@ -273,29 +498,109 @@ def epanechnikov_kernel(dist, eps):
 #     for p_num in range(n_proc):
 #         proc[p_num].join()
 #     return nu_norm
-    
-def compute_nu_norm(X, neigh_ind, K, d=None, local_subspace=None, n_proc=32):
+
+def compute_nu_norm(X, neigh_ind, K, d=None, local_subspace=None, k_pca=None, n_proc=32):
     n = X.shape[0]
     nu_norm = np.zeros(n)
-    for i in range(n):
+
+    # def target_proc(p_num, chunk_sz, q_):
+    #     start_ind = p_num*chunk_sz
+    #     if p_num == (n_proc-1):
+    #         end_ind = n
+    #     else:
+    #         end_ind = (p_num+1)*chunk_sz
+
+    #     n_inds = end_ind - start_ind
+    #     nu_norm_ = np.zeros(n_inds)
+    #     for i in range(start_ind, end_ind):
+    #         if local_subspace is not None:
+    #             if type(local_subspace) == str:
+    #                 X_i_nbrs = X[neigh_ind[i,:].tolist()+[i],:]
+    #                 pca = PCA(n_components=d)
+    #                 y = pca.fit_transform(X_i_nbrs)
+    #                 temp = y[:-1,:] - y[-1,:][None,:]
+    #             else:
+    #                 if d in local_subspace.shape:
+    #                     Q_k,Sigma_k,_ = svd(local_subspace[:,i,:].T)
+    #                 else:
+    #                     Q_k,Sigma_k,_ = svds(local_subspace[:,i,:].T, d, which='LM')
+    #                 Q_k = Q_k[:,:d]
+    #                 temp = (X[neigh_ind[i,:],:] -  X[i,:][None,:]).dot(Q_k)
+    #         else:
+    #             temp = X[neigh_ind[i,:],:]-X[i,:][None,:]
+    #         nu_norm_[i-start_ind] = np.linalg.norm(K.getrow(i)[0,neigh_ind[i,:]].dot(temp))
+
+    #     q_.put((start_ind, end_ind, nu_norm_))
+    
+    # q_ = mp.Queue()
+    # chunk_sz = int(n/n_proc)
+    # proc = []
+    # for p_num in range(n_proc):
+    #     proc.append(mp.Process(target=target_proc,
+    #                             args=(p_num,chunk_sz,q_),
+    #                             daemon=True))
+    #     proc[-1].start()
+
+    # for p_num in range(n_proc):
+    #     start_ind, end_ind, nu_norm_ = q_.get()
+    #     nu_norm[start_ind:end_ind] = nu_norm_
+
+    # q_.close()
+    # for p_num in range(n_proc):
+    #     proc[p_num].join()
+
+    def compute_nu_norm_at(i, neigh_ind_i, X_i_nbrs_, X_i, K_row_i):
         if local_subspace is not None:
             if type(local_subspace) == str:
-                X_i_nbrs = X[neigh_ind[i,:].tolist()+[i],:]
+                if k_pca:
+                    X_i_nbrs = np.concatenate([X_i_nbrs_[:k_pca,:], X_i], axis=0)
+                else:
+                    X_i_nbrs = np.concatenate([X_i_nbrs_, X_i], axis=0)
                 pca = PCA(n_components=d)
                 y = pca.fit_transform(X_i_nbrs)
                 temp = y[:-1,:] - y[-1,:][None,:]
             else:
-                if d in local_subspace.shape:
-                    Q_k,Sigma_k,_ = svd(local_subspace[:,i,:].T)
-                else:
-                    Q_k,Sigma_k,_ = svds(local_subspace[:,i,:].T, d, which='LM')
+                Q_k = local_subspace[i,:,:]
                 Q_k = Q_k[:,:d]
-                temp = (X[neigh_ind[i,:],:] -  X[i,:][None,:]).dot(Q_k)
+                temp = (X_i_nbrs_ -  X_i).dot(Q_k)
         else:
-            temp = X[neigh_ind[i,:],:]-X[i,:][None,:]
-        nu_norm[i] = np.linalg.norm(K.getrow(i)[0,neigh_ind[i,:]].dot(temp))
-        #nu_norm[i] = np.linalg.norm(np.sum(K[i,:][:,None]*temp, axis=0))
-    return nu_norm
+            temp = X_i_nbrs_-X_i
+        return np.linalg.norm(K_row_i[0,neigh_ind_i].dot(temp))
+
+    # nu_norm = Parallel(n_jobs=-1,
+    #                    batch_size=50          # Combine tasks to reduce per-task overhead
+    #                   )(delayed(compute_nu_norm_at)(i, neigh_ind[i,:], X[neigh_ind[i,:].tolist(),:],
+    #                                                          X[i:i+1,:], K.getrow(i)) for i in range(n))
+
+    nu_norm = Parallel(n_jobs=-1)(
+        delayed(compute_nu_norm_at)(
+            i, neigh_ind[i,:], X[neigh_ind[i,:].tolist(),:], X[i:i+1,:], K.getrow(i)
+        ) for i in range(n)
+    )
+    
+    # for i in range(n):
+    #     if local_subspace is not None:
+    #         if type(local_subspace) == str:
+    #             if k_pca:
+    #                 X_i_nbrs = X[neigh_ind[i,:k_pca].tolist()+[i],:]
+    #             else:
+    #                 X_i_nbrs = X[neigh_ind[i,:].tolist()+[i],:]
+    #             pca = PCA(n_components=d)
+    #             y = pca.fit_transform(X_i_nbrs)
+    #             temp = y[:-1,:] - y[-1,:][None,:]
+    #         else:
+    #             if d in local_subspace.shape:
+    #                 #Q_k,Sigma_k,_ = svd(local_subspace[:,i,:].T)
+    #                 Q_k = local_subspace[i,:,:]
+    #             else:
+    #                 Q_k,Sigma_k,_ = svds(local_subspace[:,i,:].T, d, which='LM')
+    #             Q_k = Q_k[:,:d]
+    #             temp = (X[neigh_ind[i,:],:] -  X[i,:][None,:]).dot(Q_k)
+    #     else:
+    #         temp = X[neigh_ind[i,:],:]-X[i,:][None,:]
+    #     nu_norm[i] = np.linalg.norm(K.getrow(i)[0,neigh_ind[i,:]].dot(temp))
+    #     #nu_norm[i] = np.linalg.norm(np.sum(K[i,:][:,None]*temp, axis=0))
+    return np.asarray(nu_norm)
 
 def compute_autotuned_bandwidth(neigh_ind, neigh_dist, k_tune, maxiter_for_selecting_bw):
     h_per_point = neigh_dist[:,k_tune-1]
@@ -366,6 +671,17 @@ def compute_jaccard_index(ddX, bx, prctile=10):
     mask = bx <= np.percentile(bx, prctile)
     return np.sum(mask*mask0)/np.sum((mask+mask0) > 0)
 
+
+def compute_distances_from_boundary_given_boundary(X, dM, k_nn=10, metric='euclidean', n_pca=0):
+    pts_on_boundary = np.where(dM)[0]
+    nbr_dist, nbr_ind = util_.nearest_neighbors(X, k_nn=k_nn, metric=metric)
+    if n_pca:
+        for k in range(nbr_ind.shape[0]):
+            y = PCA(n_components=n_pca).fit_transform(X[nbr_ind[k,:],:])
+            nbr_dist[k,:] = np.linalg.norm(y-y[0,:][None,:], axis=-1)
+    d_e = util_.sparse_matrix(nbr_ind, nbr_dist)
+    return dijkstra(d_e, directed=False, indices=pts_on_boundary, min_only=True)
+
 def compute_distances_from_boundary(d_e, bx, percentiles=[10]):
     max_percentile = np.max(percentiles)
     mask = bx <= np.percentile(bx, max_percentile)
@@ -420,7 +736,7 @@ def estimate_bx_berry_and_sauer(X, opts=default_opts):
 
     # Optimize for bx
     bx = optimize_for_bx(bx_init, F, F_prime, opts['optimizer_maxiter'])
-    return bx, bx_init, nu_norm
+    return bx, bx_init, K, D, nu_norm
 
 def estimate_smooth_bx_using_gd(X, W, nu_norm, h, opts=default_opts):
     d = opts['d']
@@ -487,7 +803,7 @@ def estimate_bx(X, opts=default_opts):
         g_hat = np.array(W.power(opts['s']).sum(axis=1)).flatten()/(n-1)
         return g_hat
     
-    nu_norm = compute_nu_norm(X, neigh_ind, W, d, opts['local_subspace'])
+    nu_norm = compute_nu_norm(X, neigh_ind, W, d, opts['local_subspace'], opts['k_pca'])
 
     if opts['no_newton']:
         return 1/(nu_norm+1), 1/(nu_norm+1), W, D, nu_norm
