@@ -10,16 +10,13 @@ from matplotlib import pyplot as plt
 from scipy.stats import chi2, spearmanr
 from sklearn.decomposition import PCA
 from scipy.linalg import svd
-from umap.umap_ import compute_membership_strengths
-from numba import jit
 import pdb
 from scipy.linalg import svd
 from scipy.sparse.linalg import svds
 import time
-import torch
-import torch.nn as nn
 from scipy.sparse.csgraph import dijkstra
 from joblib import Parallel, delayed
+from itertools import product
 
 import multiprocess as mp
 
@@ -246,7 +243,7 @@ def compute_q(bx, W, h, k_nn, d=2, X=None, s=2, u=0.5, metric='euclidean'):
     #q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
     q = W.sum(axis=1)
     q = np.array(q).flatten()
-    return q**(1/(1-s)), W
+    return q**(1/(1-s))
 
 def compute_q_across_s_and_u(bx, W, h, k_nn, d=2, X=None, s_list=[2], u_list=[0.5], metric='euclidean'):
     if W is None:
@@ -255,13 +252,15 @@ def compute_q_across_s_and_u(bx, W, h, k_nn, d=2, X=None, s_list=[2], u_list=[0.
         neigh_ind = neigh_ind[:,1:]
         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
 
-    q_for_each_s_and_u = []
-    for s in s_list:
-        q_for_each_u = []
-        for u in u_list:
-            qu, _ = compute_q(bx, W, h, k_nn, d=d, X=X, s=s, u=u, metric=metric)
-            q_for_each_u.append(qu)
-        q_for_each_s_and_u.append(q_for_each_u)
+    # q_for_each_s_and_u = []
+    # for s in s_list:
+    #     q_for_each_u = []
+    #     for u in u_list:
+    #         qu, _ = compute_q(bx, W, h, k_nn, d=d, X=X, s=s, u=u, metric=metric)
+    #         q_for_each_u.append(qu)
+    #     q_for_each_s_and_u.append(q_for_each_u)
+    q_for_each_s_and_u = Parallel(n_jobs=-1)(delayed(compute_q)(bx, W, h, k_nn, d, X, s, u) for s,u in product(s_list, u_list))
+    q_for_each_s_and_u = np.array(q_for_each_s_and_u).reshape(len(s_list), len(u_list), -1)
     return q_for_each_s_and_u, W
 
 def compute_q_across_k_nn_and_s_and_u(bx, h, k_nn_list=[256], d=2, X=None, s_list=[2], u_list=[0.5], metric='euclidean'):
@@ -324,7 +323,7 @@ def compute_q_wo_boundary_correction(W, h, k_nn, d=2, X=None, s=2):
     q = W.sum(axis=1)/(k_nn-1)
     q = np.array(q).flatten()
     q = 1/q
-    return q**(1/(s-1)), W
+    return q**(1/(s-1))
 
 def compute_q_wo_boundary_correction_across_s(W, h, k_nn, d=2, X=None, s_list=[2]):
     if W is None:
@@ -676,9 +675,14 @@ def compute_distances_from_boundary_given_boundary(X, dM, k_nn=10, metric='eucli
     pts_on_boundary = np.where(dM)[0]
     nbr_dist, nbr_ind = util_.nearest_neighbors(X, k_nn=k_nn, metric=metric)
     if n_pca:
-        for k in range(nbr_ind.shape[0]):
+        def refine_nbr_dist(k):
             y = PCA(n_components=n_pca).fit_transform(X[nbr_ind[k,:],:])
-            nbr_dist[k,:] = np.linalg.norm(y-y[0,:][None,:], axis=-1)
+            return np.linalg.norm(y-y[0,:][None,:], axis=-1)
+        
+        # for k in range(nbr_ind.shape[0]):
+        #     nbr_dist[k,:] = refine_nbr_dist(k)
+        nbr_dist = Parallel(n_jobs=-1)(delayed(refine_nbr_dist)(k) for k in range(nbr_ind.shape[0]))
+        nbr_dist = np.array(nbr_dist)
     d_e = util_.sparse_matrix(nbr_ind, nbr_dist)
     return dijkstra(d_e, directed=False, indices=pts_on_boundary, min_only=True)
 
