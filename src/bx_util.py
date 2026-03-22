@@ -1,24 +1,10 @@
-import sys
-sys.path.insert(0, '../pyLDLE2/')
-
 import numpy as np
-from pyLDLE2 import util_, visualize_, datasets
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix, issparse
 from scipy import optimize
-from scipy.special import erf, erfinv
-from matplotlib import pyplot as plt
-from scipy.stats import chi2, spearmanr
+from scipy.special import erf
 from sklearn.decomposition import PCA
-from scipy.linalg import svd
-from umap.umap_ import compute_membership_strengths
-from numba import jit
-import pdb
-from scipy.linalg import svd
-from scipy.sparse.linalg import svds
-import time
-import torch
-import torch.nn as nn
-from scipy.sparse.csgraph import dijkstra
+from sklearn.neighbors import NearestNeighbors
+from scipy.sparse.csgraph import dijkstra, shortest_path
 from joblib import Parallel, delayed
 from itertools import product
 
@@ -47,6 +33,61 @@ default_opts = {
     'ds': True,
     'no_newton': True
 }
+
+def nearest_neighbors(data, k_nn, metric, n_jobs=-1, sort_results=True):
+    n = data.shape[0]
+    if k_nn > 1:
+        neigh = NearestNeighbors(n_neighbors=k_nn-1, metric=metric, n_jobs=n_jobs)
+        neigh.fit(data)
+        neigh_dist, neigh_ind = neigh.kneighbors()
+        neigh_dist = np.insert(neigh_dist, 0, np.zeros(n), axis=1)
+        neigh_ind = np.insert(neigh_ind, 0, np.arange(n), axis=1)
+        if sort_results:
+            inds = np.argsort(neigh_dist, axis=-1)
+            for i in range(neigh_ind.shape[0]):
+                neigh_ind[i,:] = neigh_ind[i,inds[i,:]]
+                neigh_dist[i,:] = neigh_dist[i,inds[i,:]]
+    else:
+        neigh_dist = np.zeros((n,1))
+        neigh_ind = np.arange(n).reshape((n,1)).astype('int')
+        
+    return neigh_dist, neigh_ind
+
+def sparse_matrix(neigh_ind, neigh_dist=None):
+    if neigh_ind.dtype == object:
+        row_inds = []
+        col_inds = []
+        data = []
+        for k in range(len(neigh_ind)):
+            row_inds.append(np.repeat(k, len(neigh_ind[k])))
+            col_inds.append(neigh_ind[k].astype(int))
+            if neigh_dist is None:
+                data.append(np.ones(len(neigh_ind[k]),dtype=bool))
+            else:
+                data.append(neigh_dist[k].astype(float))
+        row_inds = np.concatenate(row_inds)
+        col_inds = np.concatenate(col_inds)
+        data = np.concatenate(data)
+    else:
+        row_inds = np.repeat(np.arange(neigh_ind.shape[0]), neigh_ind.shape[1])
+        col_inds = neigh_ind.flatten()
+        if neigh_dist is None:
+            data = np.ones_like(col_inds)
+        else:
+            data = neigh_dist.flatten()
+    return csr_matrix((data, (row_inds, col_inds)))
+
+def shortest_paths(X, n_nbrs=None, radius=None, metric='euclidean', return_predecessors=False, indices=None, directed=False):
+    assert issparse(X) or (n_nbrs is not None) or (radius is not None)
+    if issparse(X):
+        knn_graph = X
+    else:
+        nbrs = NearestNeighbors(n_neighbors=n_nbrs, radius=radius, metric=metric).fit(X)
+        if n_nbrs is not None:
+            knn_graph = nbrs.kneighbors_graph(mode='distance')
+        else:
+            knn_graph = nbrs.radius_neighbors_graph(mode='distance')
+    return shortest_path(knn_graph, return_predecessors=return_predecessors, directed=directed, indices=indices)
 
 def sinkhorn(K, maxiter=20000, delta=1e-15, eps=0, boundC = 1e-8, print_freq=1):
     """https://epubs.siam.org/doi/pdf/10.1137/20M1342124 """
@@ -78,7 +119,6 @@ def sinkhorn(K, maxiter=20000, delta=1e-15, eps=0, boundC = 1e-8, print_freq=1):
     x = x.flatten()
     K.data = K.data*x[K.row]*x[K.col]
     return K, x
-
 
 def compute_m0(bx, h, d=2):
     return 0.5*(np.pi**(d/2))*(1+erf(bx/h))
@@ -155,74 +195,9 @@ def compute_zeta(bx, h, d=2):
     temp = ((np.pi**(d/2))/2)*(bxhm1 + np.sqrt((bxhm1+m0)**2 - 2*(m1**2)))/(m2*m0-m1**2)
     return temp
 
-# def compute_q(bx, W, h, k_nn, d=2, X=None, s=2, u=0.5, metric='euclidean'):
-#     zeta = compute_zeta(bx, h, d)
-#     zeta_inv = 1/zeta
-#     zeta_inv_s = zeta_inv**s
-#     m0 = compute_m0(bx, h/np.sqrt(s), d)
-#     m0_inv = 1/m0
-#     m0_inv_u = m0_inv**u
-#     m0_inv_1mu = m0_inv**(1-u)
-#     zeta_inv_s_u = zeta_inv_s**u
-#     zeta_inv_s_1mu = zeta_inv_s**(1-u)
-    
-#     if W is None:
-#         neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric=metric)
-#         neigh_dist = neigh_dist[:,1:]
-#         neigh_ind = neigh_ind[:,1:]
-#         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
-    
-#     W = W.copy()
-#     W.data = W.data**s
-#     W = W.tocoo()
-#     W.data = m0_inv_u[W.row]*m0_inv_1mu[W.col]*zeta_inv_s_u[W.row]*zeta_inv_s_1mu[W.col]*W.data
-#     #q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
-#     q = W.sum(axis=1)
-#     q = np.array(q).flatten()
-#     return q**(1/(1-s)), W
-
-# def compute_q(bx, W, h, k_nn, d=2, X=None, s=2, u=0.5, metric='euclidean'):
-#     zeta = compute_zeta(bx, h, d)
-#     zeta_inv = 1/zeta
-#     m0 = compute_m0(bx, h/np.sqrt(s), d)
-#     m0_u = m0**u
-#     m0_1mu = m0**(1-u)
-#     zeta_inv_u = zeta_inv**u
-#     zeta_inv_1mu = zeta_inv**(1-u)
-    
-#     if W is None:
-#         neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric=metric)
-#         neigh_dist = neigh_dist[:,1:]
-#         neigh_ind = neigh_ind[:,1:]
-#         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
-    
-#     W0 = W.copy()
-#     W0 = W0.tocoo()
-#     col = W0.col.copy()
-#     row = W0.row.copy()
-#     W0 = W0.tocsr()
-#     W0.data = zeta_inv_u[row]*zeta_inv_1mu[col]*W0.data
-    
-#     m0_u_1mu_data = m0_u[row]*m0_1mu[col]
-#     W0.data = s*np.log(W0.data) - np.log(m0_u_1mu_data)
-#     W0_max_across_col = []
-#     for i in range(W0.shape[0]):
-#         W0_max_across_col.append(np.max(W0[i,:].data))
-#     W0_max_across_col = np.array(W0_max_across_col)
-#     W0.data = np.exp(W0.data - W0_max_across_col[col])
-#     q = W0.sum(axis=1)
-#     q = np.array(q).flatten()
-#     q = W0_max_across_col + np.log(q)
-#     q = q*(1/(1-s))
-#     return np.exp(q), W
-#     #q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
-#     #q = W.sum(axis=1)
-#     #q = np.array(q).flatten()
-#     #return q**(1/(1-s)), W
-
 def compute_q(bx, W, h, k_nn, d=2, X=None, s=2, u=0.5, metric='euclidean'):
     if W is None:
-        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric=metric)
+        neigh_dist, neigh_ind = nearest_neighbors(X, k_nn, metric=metric)
         neigh_dist = neigh_dist[:,1:]
         neigh_ind = neigh_ind[:,1:]
         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
@@ -251,7 +226,7 @@ def compute_q(bx, W, h, k_nn, d=2, X=None, s=2, u=0.5, metric='euclidean'):
 
 def compute_q_across_s_and_u(bx, W, h, k_nn, d=2, X=None, s_list=[2], u_list=[0.5], metric='euclidean'):
     if W is None:
-        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric=metric)
+        neigh_dist, neigh_ind = nearest_neighbors(X, k_nn, metric=metric)
         neigh_dist = neigh_dist[:,1:]
         neigh_ind = neigh_ind[:,1:]
         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
@@ -279,7 +254,7 @@ def compute_q1(bx, W, h, k_nn, d=2, X=None, s=2):
     #zeta_inv = 1/zeta
     m0 = compute_m0(bx, h/np.sqrt(s), d)
     if W is None:
-        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist, neigh_ind = nearest_neighbors(X, k_nn, metric='euclidean')
         neigh_dist = neigh_dist[:,1:]
         neigh_ind = neigh_ind[:,1:]
         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
@@ -294,30 +269,9 @@ def compute_q1(bx, W, h, k_nn, d=2, X=None, s=2):
     q = m0*(zeta**s)/q
     return q**(1/(s-1))
 
-def compute_q2(bx, W, h, k_nn, d=2, X=None, s=2):
-    zeta = compute_zeta(bx, h, d)
-    zeta_inv = 1/zeta
-    zeta_inv = zeta_inv**s
-    m0 = compute_m0(bx, h/np.sqrt(2), d)
-    if W is None:
-        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
-        neigh_dist = neigh_dist[:,1:]
-        neigh_ind = neigh_ind[:,1:]
-        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
-    
-    W = W.copy()
-    W.data = W.data**s
-    W = W.tocoo()
-    W.data = zeta_inv[W.col]*W.data
-    q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
-    #q = W.sum(axis=1)
-    q = np.array(q).flatten()
-    q = m0/q
-    return q**(1/(s-1))
-
 def compute_q_wo_boundary_correction(W, h, k_nn, d=2, X=None, s=2):
     if W is None:
-        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist, neigh_ind = nearest_neighbors(X, k_nn, metric='euclidean')
         neigh_dist = neigh_dist[:,1:]
         neigh_ind = neigh_ind[:,1:]
         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
@@ -331,7 +285,7 @@ def compute_q_wo_boundary_correction(W, h, k_nn, d=2, X=None, s=2):
 
 def compute_q_wo_boundary_correction_across_s(W, h, k_nn, d=2, X=None, s_list=[2]):
     if W is None:
-        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist, neigh_ind = nearest_neighbors(X, k_nn, metric='euclidean')
         neigh_dist = neigh_dist[:,1:]
         neigh_ind = neigh_ind[:,1:]
         W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
@@ -349,29 +303,11 @@ def compute_q_wo_boundary_correction_across_k_nn_and_s(h, k_nn_list=[256], d=2, 
         q_for_each_knn.append(q)
     return q_for_each_knn
 
-def compute_q_old(bx, W, h, k_nn, d=2, X=None):
-    m00 = compute_m0(bx, h, d)
-    m00 = (np.pi**(d/2))/m00
-    m0 = compute_m0(bx, h/np.sqrt(2), d)
-    if W is None:
-        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
-        neigh_dist = neigh_dist[:,1:]
-        neigh_ind = neigh_ind[:,1:]
-        W, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=True)
-    W = W.copy()
-    W.data = W.data**2
-    W = W.tocoo()
-    W.data = m00[W.row]*m00[W.col]*W.data
-    q = W.sum(axis=1)*(W.shape[0]-1)*((np.pi*h*np.sqrt(2))**d)
-    q = np.array(q).flatten()
-    q = 1/q
-    return q*m0
-
 def compute_q_berry_and_sauer(bx, K, h, k_nn, d=2, X=None):
     m00 = compute_m0(bx, h, d)
     m00 = 1/m00
     if K is None:
-        neigh_dist, neigh_ind = util_.nearest_neighbors(X, k_nn, metric='euclidean')
+        neigh_dist, neigh_ind = nearest_neighbors(X, k_nn, metric='euclidean')
         neigh_dist = neigh_dist[:,1:]
         neigh_ind = neigh_ind[:,1:]
         K, D = compute_self_tuned_kernel(neigh_ind, neigh_dist, h, ds=False)
@@ -432,75 +368,6 @@ def compute_dbeta(bx, h, d=2):
     
 def epanechnikov_kernel(dist, eps):
     return (1-dist**2/eps)*(dist > 0)*(dist < np.sqrt(eps))
-
-# def compute_nu_norm(X, neigh_ind, K, d=None, local_pca=False):
-#     nu_norm = np.zeros(X.shape[0])
-#     for i in range(X.shape[0]):
-#         if local_pca:
-# #             n_i = neigh_ind[i]
-# #             X_i = X[n_i,:].T # p x N_i
-# #             X_i = X_i - X[i,:][:,None]
-# #             X_i_norm = np.linalg.norm(X_i, axis=0) # N_i dimensional
-# #             D_i = np.sqrt(epanechnikov_kernel(X_i_norm, eps_pca)) #N_i dimensional
-# #             B_i = X_i * D_i[None,:]
-# #             U_i, Sigma_i, V_iT = svd(B_i)
-# #             temp = Sigma_i[:d][:,None]*V_iT[:d,:]
-# #             temp = temp.T
-#             X_i_nbrs = X[neigh_ind[i,:].tolist()+[i],:]
-#             pca = PCA(n_components=d)
-#             y = pca.fit_transform(X_i_nbrs)
-#             temp = y[:-1,:] - y[-1,:][None,:]
-#         else:
-#             temp = X[neigh_ind[i,:],:]-X[i,:][None,:]
-#         nu_norm[i] = np.linalg.norm(K.getrow(i)[0,neigh_ind[i,:]].dot(temp))
-#     return nu_norm
-
-# def compute_nu_norm(X, neigh_ind, K, d=None, local_subspace=None, n_proc=32):
-#     n = X.shape[0]
-#     nu_norm = np.zeros(n)
-#     chunk_sz = int(n/n_proc)
-#     def target_proc(p_num, q_):
-#         start_ind = p_num*chunk_sz
-#         if p_num == (n_proc-1):
-#             end_ind = n
-#         else:
-#             end_ind = (p_num+1)*chunk_sz
-#         nu_norm_ = np.zeros(end_ind-start_ind)
-#         for i in range(start_ind, end_ind):
-#             if local_subspace is not None:
-#                 if type(local_subspace) == str:
-#                     X_i_nbrs = X[neigh_ind[i,:].tolist()+[i],:]
-#                     pca = PCA(n_components=d)
-#                     y = pca.fit_transform(X_i_nbrs)
-#                     temp = y[:-1,:] - y[-1,:][None,:]
-#                 else:
-#                     if d in local_subspace.shape:
-#                         Q_k,Sigma_k,_ = svd(local_subspace[:,i,:].T)
-#                     else:
-#                         Q_k,Sigma_k,_ = svds(local_subspace[:,i,:].T, d, which='LM')
-#                     Q_k = Q_k[:,:d]
-#                     temp = (X[neigh_ind[i,:],:] -  X[i,:][None,:]).dot(Q_k)
-#             else:
-#                 temp = X[neigh_ind[i,:],:]-X[i,:][None,:]
-#             nu_norm_[i-start_ind] = np.linalg.norm(K.getrow(i)[0,neigh_ind[i,:]].dot(temp))
-#             #nu_norm[i] = np.linalg.norm(np.sum(K[i,:][:,None]*temp, axis=0))
-        
-#         q_.put((start_ind, end_ind, nu_norm_))
-    
-#     q_ = mp.Queue()
-#     proc = []
-#     for p_num in range(n_proc):
-#         proc.append(mp.Process(target=target_proc, args=(p_num, q_)))
-#         proc[-1].start()
-        
-#     for p_num in range(n_proc):
-#         start_ind, end_ind, nu_norm_ = q_.get()
-#         nu_norm[start_ind:end_ind] = nu_norm_
-#     q_.close()
-    
-#     for p_num in range(n_proc):
-#         proc[p_num].join()
-#     return nu_norm
 
 def compute_nu_norm(X, neigh_ind, K, d=None, local_subspace=None, k_pca=None, n_proc=32):
     n = X.shape[0]
@@ -677,7 +544,7 @@ def compute_jaccard_index(ddX, bx, prctile=10):
 
 def compute_distances_from_boundary_given_boundary(X, dM, k_nn=10, metric='euclidean', n_pca=0):
     pts_on_boundary = np.where(dM)[0]
-    nbr_dist, nbr_ind = util_.nearest_neighbors(X, k_nn=k_nn, metric=metric)
+    nbr_dist, nbr_ind = nearest_neighbors(X, k_nn=k_nn, metric=metric)
     if n_pca:
         def refine_nbr_dist(k):
             y = PCA(n_components=n_pca).fit_transform(X[nbr_ind[k,:],:])
@@ -687,7 +554,7 @@ def compute_distances_from_boundary_given_boundary(X, dM, k_nn=10, metric='eucli
         #     nbr_dist[k,:] = refine_nbr_dist(k)
         nbr_dist = Parallel(n_jobs=-1)(delayed(refine_nbr_dist)(k) for k in range(nbr_ind.shape[0]))
         nbr_dist = np.array(nbr_dist)
-    d_e = util_.sparse_matrix(nbr_ind, nbr_dist)
+    d_e = sparse_matrix(nbr_ind, nbr_dist)
     return dijkstra(d_e, directed=False, indices=pts_on_boundary, min_only=True)
 
 def compute_distances_from_boundary(d_e, bx, percentiles=[10]):
@@ -712,7 +579,7 @@ def estimate_bx_berry_and_sauer(X, opts=default_opts):
     d = opts['d']
     h = opts['h']
     # compute nearest neighbors
-    neigh_dist, neigh_ind = util_.nearest_neighbors(X, opts['k_nn'], metric='euclidean')
+    neigh_dist, neigh_ind = nearest_neighbors(X, opts['k_nn'], metric='euclidean')
     neigh_dist = neigh_dist[:,1:]
     neigh_ind = neigh_ind[:,1:]
 
@@ -746,51 +613,13 @@ def estimate_bx_berry_and_sauer(X, opts=default_opts):
     bx = optimize_for_bx(bx_init, F, F_prime, opts['optimizer_maxiter'])
     return bx, bx_init, K, D, nu_norm
 
-def estimate_smooth_bx_using_gd(X, W, nu_norm, h, opts=default_opts):
-    d = opts['d']
-    def F(bx):
-        m1 = compute_m1(bx, h, d)
-        m2 = compute_m2(bx, h, d)
-        zeta = compute_zeta(bx, h, d)
-        c = np.pi**(d/2)
-        return nu_norm*(c+2*m2*zeta) + h*m1*zeta
-
-    def F_prime(bx):
-        m1 = compute_m1(bx, h, d)
-        m2 = compute_m2(bx, h, d)
-        zeta = compute_zeta(bx, h, d)
-        dm1 = compute_dm1(bx, h, d)
-        dm2 = compute_dm2(bx, h, d)
-        dzeta = compute_dzeta(bx, h, d)
-        return 2*nu_norm*(dm2*zeta+m2*dzeta) + h*(dm1*zeta+m1*dzeta)
-        
-    bx = np.zeros(X.shape[0])
-    lr = opts['lr']
-    reg = opts['reg']
-    n = bx.shape[0]
-    # minimize F(bx)^2 + bx^T(I-W)bx
-    for i in range(opts['optimizer_maxiter']):
-        Fbx = F(bx)
-        Wbx = W.dot(bx)
-        bx_minus_Wbx = bx - Wbx
-        #loss = np.mean(Fbx**2) + reg * np.sum(bx*bx_minus_Wbx)
-        loss = np.mean(Fbx**2) 
-        if loss < 1e-12:
-            print('Converged at iter:', i+1)
-            break
-        print('Iter:', i+1, ':: loss:', loss)
-        grad_bx = 2*Fbx*F_prime(bx)/n + reg*bx_minus_Wbx
-        bx = bx - lr * grad_bx
-        bx = np.maximum(bx, 0)
-    return bx
-
 def estimate_bx(X, opts=default_opts):
     d = opts['d']
     h = opts['h']
     n = X.shape[0]
     
     # compute nearest neighbors
-    neigh_dist, neigh_ind = util_.nearest_neighbors(X, opts['k_nn'], metric='euclidean')
+    neigh_dist, neigh_ind = nearest_neighbors(X, opts['k_nn'], metric='euclidean')
     neigh_dist = neigh_dist[:,1:]
     neigh_ind = neigh_ind[:,1:]
 
